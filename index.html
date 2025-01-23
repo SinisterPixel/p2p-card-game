@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>P2P Card Game</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- Main Container -->
+  <div id="game-container">
+
+    <!-- Turn Indicator -->
+    <div id="turn-indicator">
+      <h2>Turn: <span id="current-player">Player ?</span></h2>
+      <button id="end-turn-btn">End Turn</button>
+    </div>
+
+    <!-- Player Stats (Health & Lifeforce) -->
+    <div id="player-stats">
+      <!-- Dynamically populated via JS: multiple .player-stat blocks -->
+    </div>
+
+    <!-- The Field (2×5) -->
+    <div id="field">
+      <!-- 10 slot divs, data-slot="1" through "10" -->
+      <div class="slot" data-slot="1"></div>
+      <div class="slot" data-slot="2"></div>
+      <div class="slot" data-slot="3"></div>
+      <div class="slot" data-slot="4"></div>
+      <div class="slot" data-slot="5"></div>
+      <div class="slot" data-slot="6"></div>
+      <div class="slot" data-slot="7"></div>
+      <div class="slot" data-slot="8"></div>
+      <div class="slot" data-slot="9"></div>
+      <div class="slot" data-slot="10"></div>
+    </div>
+
+    <!-- Hand Area (Private hands for each player) -->
+    <div id="hand-area">
+      <!-- In a simple demo, we'll have 2 players: Player 1 / Player 2.
+           Each .player-hand is labeled data-player="Player 1" or "Player 2"
+           but the final game might generate these dynamically for 2–4 players. -->
+      <div class="player-hand" data-player="Player 1">
+        <h3>Player 1 Hand</h3>
+      </div>
+      <div class="player-hand" data-player="Player 2">
+        <h3>Player 2 Hand</h3>
+      </div>
+    </div>
+
+    <!-- Game Controls -->
+    <div id="game-controls">
+      <button id="forfeit-btn">Forfeit</button>
+      <button id="deck-reset-btn">Deck Reset</button>
+      <button id="game-reset-btn">Reset Game</button>
+    </div>
+
+  </div>
+
+  <!-- The context menu for right-click actions -->
+  <div id="context-menu" style="display: none;"></div>
+
+  <!-- The zoom overlay for card inspection -->
+  <div id="zoom-overlay" style="display: none;">
+    <div id="zoom-content"></div>
+  </div>
+
+  <!-- The search modal overlay for "Search" action -->
+  <div id="search-modal-overlay" style="display: none;">
+    <div id="search-modal-content"></div>
+  </div>
+
+  <!-- Include PeerJS from CDN -->
+  <script src="https://cdn.peerjs.com/1.4.7/peerjs.min.js"></script>
+  <!-- Main JS -->
+  <script src="main.js"></script>
+</body>
+</html>
