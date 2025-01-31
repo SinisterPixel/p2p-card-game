@@ -1,920 +1,463 @@
-/*********************************************************
- * main.js
- * Combines all Steps (1–8) + final polish (Step 9).
- *********************************************************/
+/****************************************************
+ * Main JavaScript for the P2P Card Game
+ ****************************************************/
 
-/*********************************************************
- * Data Structures
- *********************************************************/
-function createPlayer(id, name) {
-  return {
-    id: id,
-    name: name,
-    health: 40,
-    lifeforce: 10,
-    hand: [],
-    isMyTurn: false,
-    hasForfeited: false
-  };
-}
-
-function createCard(cardId, front, back) {
-  return {
-    cardId: cardId,
-    front: front,
-    back: back,
-    isFaceDown: true,
-    orientation: 0,
-    slot: null
-  };
-}
-
-/*********************************************************
- * Game State
- *********************************************************/
+// Global game state object
 const gameState = {
-  players: [],
-  currentPlayerIndex: 0,
-  fieldSlots: [ [], [], [], [], [], [], [], [], [], [] ],
-  deck: [],
-  gameActive: false,
-
-  // PeerJS-related
-  isHost: false,
-  peer: null,
-  connections: [],
-  hostId: null
+  players: [],           // Array of player objects { id, hp, lifeforce, hand: [], ... }
+  currentTurn: null,     // The peer id of the current turn
+  hostId: null,          // Host peer id (if this instance is host)
+  peer: null,            // PeerJS instance
+  conn: null,            // Connection to host (if client)
+  deck: [],              // The deck of cards (array of card objects)
+  battlefield: {},       // Map slotNumber -> array of card ids
 };
 
-/*********************************************************
- * Utility Functions
- *********************************************************/
+// Utility functions
 function clamp(value, min, max) {
-  return Math.max(min, Math.min(value, max));
+  return Math.min(Math.max(value, min), max);
+}
+function randomChoice(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function getRandomFirstTurn(playerCount) {
-  return Math.floor(Math.random() * playerCount);
-}
+// --- Card Database ---
+// Will be loaded from cards.json (see file below)
+let cardDatabase = [];
 
-function clampHealth(health) {
-  return Math.max(health, 0);
-}
+/* -------------- Initialization -------------- */
+document.addEventListener('DOMContentLoaded', () => {
+  // Load card database then initialize game
+  fetch('cards.json')
+    .then(response => response.json())
+    .then(data => {
+      cardDatabase = data;
+      // After loading cards, initialize deck slicing and game setup
+      sliceDeckImage();
+      initGame();
+    })
+    .catch(err => console.error('Error loading cards.json:', err));
+});
 
-function clampLifeforce(lifeforce) {
-  return clamp(lifeforce, 0, 10);
-}
-
-/*********************************************************
- * PeerJS Setup
- *********************************************************/
-function initPeerJS() {
+/* -------------- Game Initialization -------------- */
+function initGame() {
+  // Determine whether to create host or join a game using URL parameters
   const urlParams = new URLSearchParams(window.location.search);
-  const joinId = urlParams.get("joinId");
-
-  if (!joinId) {
-    // We are the host
-    gameState.isHost = true;
-    gameState.peer = new Peer();
-
-    gameState.peer.on("open", (id) => {
-      console.log("Host PeerJS ID:", id);
-      gameState.hostId = id;
-      initGameAsHost();
-    });
-
-    gameState.peer.on("connection", (conn) => {
-      console.log("Incoming connection from", conn.peer);
-      setupDataConnection(conn);
-      gameState.connections.push(conn);
-      // We could also add logic to dynamically add them as a player, etc.
-    });
-
+  const joinId = urlParams.get('joinId');
+  if (joinId) {
+    initPeerClient(joinId);
   } else {
-    // We are a client
-    gameState.isHost = false;
-    gameState.hostId = joinId;
-    gameState.peer = new Peer();
+    initPeerHost();
+  }
+  setupUIListeners();
+  setupDragAndDrop();
+}
 
-    gameState.peer.on("open", (id) => {
-      console.log("Client PeerJS ID:", id);
-      const conn = gameState.peer.connect(gameState.hostId);
-      conn.on("open", () => {
-        console.log("Connected to host:", gameState.hostId);
-        setupDataConnection(conn);
-        gameState.connections.push(conn);
-      });
+/* -------------- PeerJS Setup -------------- */
+// Host Setup
+function initPeerHost() {
+  const peer = new Peer(); // generates an id automatically
+  gameState.peer = peer;
+  peer.on('open', id => {
+    gameState.hostId = id;
+    console.log('Hosting game with Peer ID:', id);
+    // For convenience, display join instructions:
+    alert(`Hosting game. To join, open another browser window with "?joinId=${id}" appended to the URL.`);
+    // Add host as a player:
+    addPlayer(id);
+    // Set current turn to host initially
+    gameState.currentTurn = id;
+    updateTurnIndicator();
+  });
+  // Listen for incoming connections:
+  peer.on('connection', conn => {
+    conn.on('data', data => {
+      handleIncomingAction(data, conn);
     });
-  }
-}
-
-function setupDataConnection(conn) {
-  conn.on("data", (message) => {
-    handlePeerMessage(conn, message);
-  });
-
-  conn.on("close", () => {
-    console.log("Connection closed:", conn.peer);
-    gameState.connections = gameState.connections.filter((c) => c !== conn);
-  });
-
-  conn.on("error", (err) => {
-    console.error("Connection error:", err);
   });
 }
-
-/*********************************************************
- * Message Handling
- *********************************************************/
-function handlePeerMessage(conn, message) {
-  switch (message.type) {
-    case "REQUEST_GAME_STATE":
-      if (gameState.isHost) {
-        broadcastGameState(conn);
-      }
-      break;
-
-    case "SYNC_GAME_STATE":
-      if (!gameState.isHost) {
-        updateGameStateFromHost(message.payload);
-      }
-      break;
-
-    case "PLAYER_ACTION":
-      if (gameState.isHost) {
-        handlePlayerAction(conn, message.payload);
-      }
-      break;
-
-    default:
-      console.warn("Unknown message type:", message.type);
-  }
-}
-
-function broadcastGameState(targetConn) {
-  const stateToSend = JSON.parse(JSON.stringify(gameState));
-  const message = {
-    type: "SYNC_GAME_STATE",
-    payload: stateToSend
-  };
-  if (targetConn) {
-    targetConn.send(message);
-  } else {
-    for (let c of gameState.connections) {
-      c.send(message);
-    }
-  }
-}
-
-function updateGameStateFromHost(hostState) {
-  Object.assign(gameState, hostState);
-  refreshUI();
-}
-
-/*********************************************************
- * Host Initialization
- *********************************************************/
-function initGameAsHost() {
-  // Example: Two players (p1 = host, p2 = client)
-  gameState.players = [
-    createPlayer("p1", "Player 1"),
-    createPlayer("p2", "Player 2")
-  ];
-
-  // Create 41 cards
-  gameState.deck = [];
-  for (let i = 0; i < 41; i++) {
-    const card = createCard(
-      `card-${i}`,
-      `assets/front-${i}.png`,
-      `assets/back.png`
-    );
-    gameState.deck.push(card);
-  }
-
-  // Decide who goes first randomly
-  gameState.currentPlayerIndex = getRandomFirstTurn(gameState.players.length);
-  gameState.players[gameState.currentPlayerIndex].isMyTurn = true;
-  gameState.gameActive = true;
-
-  // Optionally place hero & deck
-  applyDeckReset();
-
-  console.log("Host initialized gameState:", gameState);
-  broadcastGameState();
-}
-
-/*********************************************************
- * End Turn Logic (Host)
- *********************************************************/
-function endTurn(playerId) {
-  const currentPlayer = gameState.players[gameState.currentPlayerIndex];
-  if (currentPlayer.id !== playerId) {
-    console.log("Invalid endTurn: not current player's ID.");
-    return;
-  }
-
-  // Move to next player
-  currentPlayer.isMyTurn = false;
-  gameState.currentPlayerIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length;
-  const nextPlayer = gameState.players[gameState.currentPlayerIndex];
-  nextPlayer.isMyTurn = true;
-
-  // Start-of-turn lifeforce +5 (max 10)
-  nextPlayer.lifeforce = clampLifeforce(nextPlayer.lifeforce + 5);
-
-  console.log(`End turn for ${playerId}, next player: ${nextPlayer.name}`);
-}
-
-/*********************************************************
- * Resource Updates
- *********************************************************/
-function applyResourceUpdate(playerId, resourceType, newValue) {
-  const player = gameState.players.find(p => p.id === playerId);
-  if (!player) return;
-
-  if (resourceType === "health") {
-    player.health = clampHealth(newValue);
-  } else if (resourceType === "lifeforce") {
-    player.lifeforce = clampLifeforce(newValue);
-  }
-}
-
-/*********************************************************
- * Forfeit
- *********************************************************/
-function applyForfeit(playerId) {
-  const player = gameState.players.find(p => p.id === playerId);
-  if (!player) return;
-  player.hasForfeited = true;
-
-  const activePlayers = gameState.players.filter(p => !p.hasForfeited);
-  if (activePlayers.length <= 1) {
-    console.log("Game ends due to forfeit. Winner:", activePlayers[0]?.name || "None");
-    gameState.gameActive = false;
-  }
-}
-
-/*********************************************************
- * Deck Reset
- *********************************************************/
-function applyDeckReset() {
-  // Clear slots
-  for (let slotArr of gameState.fieldSlots) slotArr.length = 0;
-  // Clear hands
-  for (let p of gameState.players) p.hand = [];
-
-  // Must have at least 41 cards
-  if (gameState.deck.length < 41) {
-    console.warn("Not enough cards for deck reset.");
-    return;
-  }
-
-  const heroCard = gameState.deck[0];
-  // Slot 3 => index 2
-  gameState.fieldSlots[2].push(heroCard);
-
-  // Next 40 cards => slot 9 => index 8
-  for (let i = 1; i < 41; i++) {
-    gameState.fieldSlots[8].push(gameState.deck[i]);
-  }
-}
-
-/*********************************************************
- * Game Reset
- *********************************************************/
-function applyGameReset() {
-  console.log("Game reset initiated.");
-
-  // Re-init players
-  for (let p of gameState.players) {
-    p.health = 40;
-    p.lifeforce = 10;
-    p.hand = [];
-    p.hasForfeited = false;
-    p.isMyTurn = false;
-  }
-
-  // Clear field
-  for (let slotArr of gameState.fieldSlots) slotArr.length = 0;
-
-  // Rebuild deck
-  gameState.deck = [];
-  for (let i = 0; i < 41; i++) {
-    const card = createCard(`card-${i}`, `assets/front-${i}.png`, `assets/back.png`);
-    gameState.deck.push(card);
-  }
-
-  // Random turn
-  gameState.currentPlayerIndex = getRandomFirstTurn(gameState.players.length);
-  gameState.players[gameState.currentPlayerIndex].isMyTurn = true;
-  gameState.gameActive = true;
-
-  // Place hero + deck
-  applyDeckReset();
-}
-
-/*********************************************************
- * Move Card to Slot
- *********************************************************/
-function moveCardToSlot(cardId, slotIndex, fromHand, fromSlotIndex) {
-  let card = null;
-
-  if (fromHand) {
-    // Find card in any player's hand
-    for (let player of gameState.players) {
-      const idx = player.hand.findIndex(c => c.cardId === cardId);
-      if (idx !== -1) {
-        card = player.hand[idx];
-        player.hand.splice(idx, 1);
-        break;
-      }
-    }
-  } else if (fromSlotIndex !== null) {
-    const stack = gameState.fieldSlots[fromSlotIndex];
-    const idx = stack.findIndex(c => c.cardId === cardId);
-    if (idx !== -1) {
-      card = stack[idx];
-      stack.splice(idx, 1);
-    }
-  }
-
-  if (!card) {
-    console.warn("moveCardToSlot: Card not found:", cardId);
-    return;
-  }
-
-  gameState.fieldSlots[slotIndex].push(card);
-  card.slot = slotIndex;
-}
-
-/*********************************************************
- * Player Actions (Host)
- *********************************************************/
-function handlePlayerAction(conn, actionPayload) {
-  switch (actionPayload.action) {
-    case "END_TURN":
-      endTurn(actionPayload.playerId);
-      break;
-
-    case "MOVE_CARD_TO_SLOT":
-      moveCardToSlot(
-        actionPayload.cardId,
-        actionPayload.slotIndex,
-        actionPayload.fromHand,
-        actionPayload.fromSlotIndex
-      );
-      break;
-
-    case "CONTEXT_ACTION": {
-      const { actionType, target } = actionPayload;
-      const reconstructed = reconstructTargetFromClient(target);
-      applyContextAction(actionType, reconstructed);
-      break;
-    }
-
-    case "UPDATE_RESOURCE":
-      applyResourceUpdate(actionPayload.playerId, actionPayload.resourceType, actionPayload.newValue);
-      break;
-
-    case "FORFEIT":
-      applyForfeit(actionPayload.playerId);
-      break;
-
-    case "DECK_RESET":
-      applyDeckReset();
-      break;
-
-    case "GAME_RESET":
-      applyGameReset();
-      break;
-
-    default:
-      console.log("Unrecognized action:", actionPayload);
-  }
-  broadcastGameState();
-}
-
-/*********************************************************
- * Reconstruct Target from Client (Security)
- *********************************************************/
-function reconstructTargetFromClient(clientTarget) {
-  let result = {
-    isSlot: clientTarget.isSlot,
-    slotIndex: null,
-    stack: [],
-    isHandCard: clientTarget.isHandCard,
-    cardObject: null
-  };
-
-  if (clientTarget.isSlot && typeof clientTarget.slotIndex === "number") {
-    result.slotIndex = clientTarget.slotIndex;
-    result.stack = gameState.fieldSlots[clientTarget.slotIndex] || [];
-  }
-  if (clientTarget.isHandCard && clientTarget.cardObject) {
-    const realCard = findCardInAllHands(clientTarget.cardObject.cardId);
-    if (realCard) {
-      result.cardObject = realCard;
-    }
-  }
-  return result;
-}
-
-function findCardInAllHands(cardId) {
-  for (let p of gameState.players) {
-    for (let c of p.hand) {
-      if (c.cardId === cardId) return c;
-    }
-  }
-  return null;
-}
-
-/*********************************************************
- * Context Actions
- *********************************************************/
-function applyContextAction(actionType, targetInfo) {
-  switch (actionType) {
-    case "FLIP":
-      flipTopCard(targetInfo);
-      break;
-    case "ROTATE":
-      rotateTopCard(targetInfo);
-      break;
-    case "ZOOM":
-      // Only open locally on the host side
-      openZoomModal(getTopCard(targetInfo));
-      break;
-    case "SEARCH":
-      openSearchModal(targetInfo);
-      break;
-    case "SHUFFLE":
-      shuffleStack(targetInfo.stack);
-      break;
-    case "DRAW":
-      drawTopCard(targetInfo);
-      break;
-    default:
-      console.log("Unknown context action:", actionType);
-  }
-}
-
-function getTopCard(targetInfo) {
-  if (targetInfo.isSlot && targetInfo.stack.length > 0) {
-    return targetInfo.stack[targetInfo.stack.length - 1];
-  } else if (targetInfo.isHandCard && targetInfo.cardObject) {
-    return targetInfo.cardObject;
-  }
-  return null;
-}
-
-function flipTopCard(targetInfo) {
-  const card = getTopCard(targetInfo);
-  if (card) card.isFaceDown = !card.isFaceDown;
-}
-
-function rotateTopCard(targetInfo) {
-  const card = getTopCard(targetInfo);
-  if (card) card.orientation = (card.orientation + 90) % 360;
-}
-
-function openZoomModal(card) {
-  if (!card) return;
-  let zoomOverlay = document.getElementById("zoom-overlay");
-  let zoomContent = document.getElementById("zoom-content");
-  if (!zoomOverlay || !zoomContent) return;
-
-  const imgSrc = card.isFaceDown ? card.back : card.front;
-  zoomContent.style.backgroundImage = `url(${imgSrc})`;
-
-  zoomOverlay.style.display = "block";
-  // Close on click
-  zoomOverlay.onclick = () => {
-    zoomOverlay.style.display = "none";
-  };
-}
-
-function openSearchModal(targetInfo) {
-  let overlay = document.getElementById("search-modal-overlay");
-  let content = document.getElementById("search-modal-content");
-  if (!overlay || !content) return;
-
-  content.innerHTML = `<h2>Search Results</h2>`;
-  const stack = targetInfo.stack;
-  stack.forEach(card => {
-    let cardElem = document.createElement("div");
-    cardElem.classList.add("card");
-    cardElem.style.backgroundImage = `url(${card.isFaceDown ? card.back : card.front})`;
-    // Let user drag the card out
-    cardElem.draggable = true;
-    cardElem.ondragstart = () => {
-      draggedCardData = {
-        cardId: card.cardId,
-        fromHand: false,
-        fromSlotIndex: targetInfo.slotIndex
-      };
-    };
-    content.appendChild(cardElem);
-  });
-
-  overlay.style.display = "block";
-  overlay.onclick = (evt) => {
-    if (evt.target === overlay) {
-      overlay.style.display = "none";
-      content.innerHTML = "";
-    }
-  };
-}
-
-function shuffleStack(stack) {
-  for (let i = stack.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [stack[i], stack[j]] = [stack[j], stack[i]];
-  }
-}
-
-function drawTopCard(targetInfo) {
-  const topCard = getTopCard(targetInfo);
-  if (!topCard) return;
-  targetInfo.stack.pop(); // remove from stack
-  // Give it to the current player
-  const currentP = gameState.players[gameState.currentPlayerIndex];
-  currentP.hand.push(topCard);
-}
-
-/*********************************************************
- * Client -> Host Player Actions
- *********************************************************/
-function sendPlayerAction(payload) {
-  const hostConn = gameState.connections[0];
-  if (!hostConn) return;
-  hostConn.send({
-    type: "PLAYER_ACTION",
-    payload
-  });
-}
-
-/*********************************************************
- * Rendering / UI
- *********************************************************/
-
-// Track a card being dragged
-let draggedCardData = null;
-
-function refreshUI() {
-  renderFieldSlots();
-  renderPlayerHands();
-  renderTurnIndicator();
-  renderPlayerStats();
-}
-
-function renderFieldSlots() {
-  const fieldContainer = document.getElementById("field");
-  if (!fieldContainer) return;
-
-  Array.from(fieldContainer.children).forEach((slotElem) => {
-    slotElem.innerHTML = "";
-  });
-
-  for (let slotIndex = 0; slotIndex < 10; slotIndex++) {
-    const slotElem = fieldContainer.querySelector(`[data-slot="${slotIndex+1}"]`);
-    if (!slotElem) continue;
-
-    slotElem.ondragover = (evt) => {
-      evt.preventDefault();
-    };
-    slotElem.ondrop = (evt) => {
-      evt.preventDefault();
-      handleDropOnSlot(slotIndex);
-    };
-    slotElem.oncontextmenu = (evt) => {
-      const stack = gameState.fieldSlots[slotIndex];
-      openContextMenu(evt, {
-        isSlot: true,
-        slotIndex: slotIndex,
-        stack: stack,
-        isHandCard: false
-      });
-    };
-
-    const stack = gameState.fieldSlots[slotIndex];
-    if (stack.length > 0) {
-      const topCard = stack[stack.length - 1];
-      const cardElem = createCardElement(topCard, false);
-
-      if (stack.length > 1) {
-        const stackCountBadge = document.createElement("div");
-        stackCountBadge.classList.add("stack-count-badge");
-        stackCountBadge.innerText = stack.length;
-        cardElem.appendChild(stackCountBadge);
-      }
-
-      cardElem.oncontextmenu = (evt) => {
-        openContextMenu(evt, {
-          isSlot: true,
-          slotIndex: slotIndex,
-          stack: stack,
-          isHandCard: false
-        });
-      };
-
-      slotElem.appendChild(cardElem);
-    }
-  }
-}
-
-function renderPlayerHands() {
-  const handArea = document.getElementById("hand-area");
-  if (!handArea) return;
-
-  Array.from(handArea.children).forEach((pHand) => {
-    const label = pHand.getAttribute("data-player") + " Hand";
-    pHand.innerHTML = `<h3>${label}</h3>`;
-  });
-
-  gameState.players.forEach((player) => {
-    const selector = `.player-hand[data-player="${player.name}"]`;
-    const handElem = handArea.querySelector(selector);
-    if (!handElem) return;
-
-    player.hand.forEach((card) => {
-      const isLocal = isThisLocalPlayer(player);
-      const cardElem = createCardElement(card, isLocal);
-      if (isLocal) {
-        cardElem.draggable = true;
-        cardElem.ondragstart = () => {
-          draggedCardData = {
-            cardId: card.cardId,
-            fromHand: true,
-            fromSlotIndex: null
-          };
-        };
-      }
-      cardElem.oncontextmenu = (evt) => {
-        if (isLocal) {
-          openContextMenu(evt, {
-            isSlot: false,
-            slotIndex: null,
-            stack: [],
-            isHandCard: true,
-            cardObject: card
-          });
-        } else {
-          evt.preventDefault();
-        }
-      };
-      handElem.appendChild(cardElem);
+// Client Setup
+function initPeerClient(hostId) {
+  const peer = new Peer();
+  gameState.peer = peer;
+  peer.on('open', id => {
+    console.log('Client Peer ID:', id, 'Connecting to host:', hostId);
+    const conn = peer.connect(hostId);
+    gameState.conn = conn;
+    conn.on('open', () => {
+      // Send join message to host
+      conn.send({ action: 'join', peerId: id });
+    });
+    conn.on('data', data => {
+      handleIncomingAction(data);
     });
   });
 }
 
-function renderTurnIndicator() {
-  const elem = document.getElementById("current-player");
-  if (!elem) return;
-  const currP = gameState.players[gameState.currentPlayerIndex];
-  elem.innerText = currP ? currP.name : "???";
-}
-
-function renderPlayerStats() {
-  const statsArea = document.getElementById("player-stats");
-  if (!statsArea) return;
-  statsArea.innerHTML = "";
-
-  gameState.players.forEach((player) => {
-    const div = document.createElement("div");
-    div.classList.add("player-stat");
-
-    const isLocal = isThisLocalPlayer(player);
-
-    div.innerHTML = `
-      <h3>${player.name}</h3>
-      <p>
-        Health: <span class="health-value">${player.health}</span>
-        ${isLocal ? `<button class="health-minus">-</button><button class="health-plus">+</button>` : ""}
-      </p>
-      <p>
-        Lifeforce: <span class="lifeforce-value">${player.lifeforce}</span>
-        ${isLocal ? `<button class="life-minus">-</button><button class="life-plus">+</button>` : ""}
-      </p>
-    `;
-
-    statsArea.appendChild(div);
-
-    if (isLocal) {
-      const hm = div.querySelector(".health-minus");
-      const hp = div.querySelector(".health-plus");
-      const lm = div.querySelector(".life-minus");
-      const lp = div.querySelector(".life-plus");
-
-      hm.onclick = () => updatePlayerResource(player.id, "health", player.health - 1);
-      hp.onclick = () => updatePlayerResource(player.id, "health", player.health + 1);
-      lm.onclick = () => updatePlayerResource(player.id, "lifeforce", player.lifeforce - 1);
-      lp.onclick = () => updatePlayerResource(player.id, "lifeforce", player.lifeforce + 1);
-    }
-  });
-}
-
-function createCardElement(card, faceUp) {
-  const cardElem = document.createElement("div");
-  cardElem.classList.add("card");
-  const imgSrc = faceUp && !card.isFaceDown ? card.front : card.back;
-  cardElem.style.backgroundImage = `url(${imgSrc})`;
-  cardElem.dataset.cardId = card.cardId;
-  cardElem.style.transform = `rotate(${card.orientation}deg)`;
-  return cardElem;
-}
-
-/*********************************************************
- * Drag-and-Drop Helpers
- *********************************************************/
-function handleDropOnSlot(slotIndex) {
-  if (!draggedCardData) return;
-  if (gameState.isHost) {
-    moveCardToSlot(draggedCardData.cardId, slotIndex, draggedCardData.fromHand, draggedCardData.fromSlotIndex);
-    broadcastGameState();
-  } else {
-    sendPlayerAction({
-      action: "MOVE_CARD_TO_SLOT",
-      cardId: draggedCardData.cardId,
-      slotIndex,
-      fromHand: draggedCardData.fromHand,
-      fromSlotIndex: draggedCardData.fromSlotIndex
-    });
-  }
-  draggedCardData = null;
-}
-
-/*********************************************************
- * Context Menu
- *********************************************************/
-let contextTarget = {};
-
-function getContextMenuElement() {
-  let menu = document.getElementById("context-menu");
-  if (!menu) {
-    menu = document.createElement("div");
-    menu.id = "context-menu";
-    menu.style.display = "none";
-    document.body.appendChild(menu);
-  }
-  return menu;
-}
-
-function openContextMenu(evt, targetInfo) {
-  evt.preventDefault();
-  closeContextMenu();
-  contextTarget = targetInfo;
-  const menu = getContextMenuElement();
-  menu.innerHTML = "";
-
-  const actions = determineContextActions(targetInfo);
-  actions.forEach(action => {
-    const btn = document.createElement("button");
-    btn.innerText = action.label;
-    btn.onclick = () => {
-      closeContextMenu();
-      handleContextAction(action.type);
-    };
-    menu.appendChild(btn);
-  });
-
-  menu.style.display = "block";
-  menu.style.left = evt.pageX + "px";
-  menu.style.top = evt.pageY + "px";
-}
-
-function closeContextMenu() {
-  const menu = getContextMenuElement();
-  menu.style.display = "none";
-}
-
-function determineContextActions(targetInfo) {
-  const actions = [];
-  if (targetInfo.isSlot && targetInfo.stack.length > 0) {
-    actions.push({ type: "FLIP", label: "Flip Top Card" });
-    actions.push({ type: "ROTATE", label: "Rotate Top Card" });
-    actions.push({ type: "ZOOM", label: "Zoom Top Card" });
-    actions.push({ type: "SEARCH", label: "Search Stack" });
-    actions.push({ type: "SHUFFLE", label: "Shuffle Stack" });
-    actions.push({ type: "DRAW", label: "Draw Top Card" });
-  } else if (targetInfo.isHandCard && targetInfo.cardObject) {
-    actions.push({ type: "FLIP", label: "Flip Card" });
-    actions.push({ type: "ROTATE", label: "Rotate Card" });
-    actions.push({ type: "ZOOM", label: "Zoom Card" });
-  }
-  return actions;
-}
-
-function handleContextAction(actionType) {
-  if (gameState.isHost) {
-    applyContextAction(actionType, contextTarget);
-    broadcastGameState();
-  } else {
-    sendPlayerAction({
-      action: "CONTEXT_ACTION",
-      actionType: actionType,
-      target: contextTarget
-      // In production, only send minimal data: { slotIndex, cardId, etc. }
-    });
-  }
-}
-
-/*********************************************************
- * Checking Local Player
- *********************************************************/
-function isThisLocalPlayer(player) {
-  // Simple assumption: host = "p1", client = "p2", etc.
-  if (gameState.isHost && player.id === "p1") return true;
-  if (!gameState.isHost && player.id === "p2") return true;
-  return false;
-}
-
-/*********************************************************
- * End Turn Button
- *********************************************************/
-function setupEndTurnButton() {
-  const btn = document.getElementById("end-turn-btn");
-  if (!btn) return;
-  btn.onclick = () => {
-    const currentP = gameState.players[gameState.currentPlayerIndex];
-    if (isThisLocalPlayer(currentP)) {
-      if (gameState.isHost) {
-        endTurn(currentP.id);
+/* -------------- Action Handling -------------- */
+function handleIncomingAction(data, conn = null) {
+  // Process incoming messages (from clients or host)
+  switch(data.action) {
+    case 'join':
+      // Only host should process join messages
+      if (gameState.hostId) {
+        addPlayer(data.peerId);
         broadcastGameState();
-      } else {
-        sendPlayerAction({ action: "END_TURN", playerId: currentP.id });
       }
-    } else {
-      console.log("Not your turn, cannot end turn.");
-    }
-  };
+      break;
+    case 'moveCard':
+      // Update card position (data.details: { cardId, slot })
+      updateCardSlot(data.details.cardId, data.details.slot);
+      break;
+    case 'flipCard':
+      toggleFlipCard(data.details.cardId);
+      break;
+    case 'rotateCard':
+      rotateCard(data.details.cardId);
+      break;
+    case 'endTurn':
+      endTurn();
+      break;
+    case 'updateState':
+      // For client: update local game state from host
+      Object.assign(gameState, data.state);
+      refreshUI();
+      break;
+    default:
+      console.warn('Unhandled action:', data.action);
+  }
+  // If this instance is the host, broadcast updated state
+  if (gameState.hostId && gameState.peer && gameState.peer.connections) {
+    broadcastGameState();
+  }
 }
 
-/*********************************************************
- * Update Player Resource (Local -> Host)
- *********************************************************/
-function updatePlayerResource(playerId, resourceType, newValue) {
-  if (gameState.isHost) {
-    applyResourceUpdate(playerId, resourceType, newValue);
-    broadcastGameState();
-  } else {
-    sendPlayerAction({
-      action: "UPDATE_RESOURCE",
-      playerId,
-      resourceType,
-      newValue
+/* -------------- Player Management -------------- */
+function addPlayer(peerId) {
+  // Only add if not already present
+  if (!gameState.players.find(p => p.id === peerId)) {
+    const newPlayer = {
+      id: peerId,
+      hp: 40,
+      lifeforce: 10,
+      hand: []
+    };
+    gameState.players.push(newPlayer);
+    console.log('Player added:', newPlayer);
+    updateResourceDisplays();
+  }
+}
+
+/* -------------- Broadcast Game State (Host Only) -------------- */
+function broadcastGameState() {
+  if (gameState.hostId && gameState.peer.connections) {
+    Object.values(gameState.peer.connections).forEach(connArray => {
+      connArray.forEach(conn => {
+        conn.send({ action: 'updateState', state: gameState });
+      });
     });
   }
 }
 
-/*********************************************************
- * Window On Load
- *********************************************************/
-window.addEventListener("DOMContentLoaded", () => {
-  initPeerJS();
-  setupEndTurnButton();
+/* -------------- UI Listeners -------------- */
+function setupUIListeners() {
+  document.getElementById('end-turn').addEventListener('click', () => {
+    if (isMyTurn()) {
+      sendAction({ action: 'endTurn' });
+      endTurn();
+    }
+  });
+  document.getElementById('reset-game').addEventListener('click', resetGame);
+  document.getElementById('forfeit').addEventListener('click', forfeitGame);
+  
+  // Context menu listener
+  document.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    if (e.target.classList.contains('card')) {
+      showContextMenu(e.pageX, e.pageY, e.target);
+    }
+  });
+  document.addEventListener('click', hideContextMenu);
+}
 
-  // Forfeit, Deck Reset, Game Reset buttons
-  const forfeitBtn = document.getElementById("forfeit-btn");
-  if (forfeitBtn) {
-    forfeitBtn.onclick = () => {
-      if (confirm("Are you sure you want to forfeit?")) {
-        const localPlayer = gameState.players.find(p => isThisLocalPlayer(p));
-        if (!localPlayer) return;
-        if (gameState.isHost) {
-          applyForfeit(localPlayer.id);
-          broadcastGameState();
-        } else {
-          sendPlayerAction({ action: "FORFEIT", playerId: localPlayer.id });
-        }
-      }
-    };
+/* -------------- UI Update Functions -------------- */
+function updateResourceDisplays() {
+  // Assume the local player is the one whose id equals gameState.peer.id
+  const localPlayer = gameState.players.find(p => p.id === gameState.peer.id);
+  if (localPlayer) {
+    document.getElementById('hp-display').textContent = `HP: ${localPlayer.hp}`;
+    document.getElementById('lifeforce-display').textContent = `Lifeforce: ${localPlayer.lifeforce}`;
   }
+}
+function updateTurnIndicator() {
+  document.getElementById('turn-indicator').textContent = `Current Turn: ${gameState.currentTurn}`;
+}
+function refreshUI() {
+  // For a full implementation, update the battlefield, hand, and other dynamic UI parts.
+  updateResourceDisplays();
+  updateTurnIndicator();
+}
 
-  const deckResetBtn = document.getElementById("deck-reset-btn");
-  if (deckResetBtn) {
-    deckResetBtn.onclick = () => {
-      if (confirm("Are you sure you want to reset the deck?")) {
-        if (gameState.isHost) {
-          applyDeckReset();
-          broadcastGameState();
-        } else {
-          sendPlayerAction({ action: "DECK_RESET" });
-        }
-      }
-    };
+/* -------------- Turn Management -------------- */
+function isMyTurn() {
+  return gameState.peer.id === gameState.currentTurn;
+}
+function endTurn() {
+  // Regenerate lifeforce (+5, max 10) for the player whose turn is ending
+  gameState.players.forEach(p => {
+    p.lifeforce = clamp(p.lifeforce + 5, 0, 10);
+  });
+  // Rotate turn order: simply select the next player in the players array
+  if (gameState.players.length > 0) {
+    const currentIndex = gameState.players.findIndex(p => p.id === gameState.currentTurn);
+    const nextIndex = (currentIndex + 1) % gameState.players.length;
+    gameState.currentTurn = gameState.players[nextIndex].id;
   }
+  updateTurnIndicator();
+  updateResourceDisplays();
+  broadcastGameState();
+}
 
-  const gameResetBtn = document.getElementById("game-reset-btn");
-  if (gameResetBtn) {
-    gameResetBtn.onclick = () => {
-      if (confirm("Are you sure you want to reset the game?")) {
-        if (gameState.isHost) {
-          applyGameReset();
-          broadcastGameState();
-        } else {
-          sendPlayerAction({ action: "GAME_RESET" });
-        }
-      }
-    };
+/* -------------- Global Game Controls -------------- */
+function resetGame() {
+  if (confirm('Reset the game?')) {
+    location.reload();
+  }
+}
+function forfeitGame() {
+  if (confirm('Forfeit? Other players will be declared winners.')) {
+    alert('You have forfeited.');
+    // Additional forfeit logic would be implemented here.
+  }
+}
+
+/* -------------- Drag & Drop Implementation -------------- */
+function setupDragAndDrop() {
+  // Allow cards (in hand or on the battlefield) to be draggable.
+  document.querySelectorAll('.card').forEach(card => {
+    card.setAttribute('draggable', true);
+    card.addEventListener('dragstart', handleDragStart);
+    card.addEventListener('dragend', handleDragEnd);
+  });
+  // Set drag listeners on all slots.
+  document.querySelectorAll('.slot').forEach(slot => {
+    slot.addEventListener('dragover', handleDragOver);
+    slot.addEventListener('drop', handleDrop);
+  });
+}
+function handleDragStart(e) {
+  e.dataTransfer.setData('text/plain', e.target.id);
+  e.target.classList.add('dragging');
+}
+function handleDragEnd(e) {
+  e.target.classList.remove('dragging');
+}
+function handleDragOver(e) {
+  e.preventDefault();
+}
+function handleDrop(e) {
+  e.preventDefault();
+  const cardId = e.dataTransfer.getData('text/plain');
+  const cardElem = document.getElementById(cardId);
+  e.currentTarget.appendChild(cardElem);
+  const slotNumber = e.currentTarget.getAttribute('data-slot');
+  // Send a moveCard action
+  sendAction({
+    action: 'moveCard',
+    details: { cardId, slot: slotNumber }
+  });
+  updateCardSlot(cardId, slotNumber);
+  broadcastGameState();
+}
+
+/* -------------- Card Interaction Functions -------------- */
+function updateCardSlot(cardId, slotNumber) {
+  // Update your gameState to reflect that the card with cardId is now in the given slot.
+  // For simplicity, we assume gameState.battlefield[slotNumber] is an array of cardIds.
+  if (!gameState.battlefield[slotNumber]) {
+    gameState.battlefield[slotNumber] = [];
+  }
+  // Remove cardId from any other slot arrays:
+  for (const slot in gameState.battlefield) {
+    gameState.battlefield[slot] = gameState.battlefield[slot].filter(id => id !== cardId);
+  }
+  gameState.battlefield[slotNumber].push(cardId);
+  console.log(`Card ${cardId} now in slot ${slotNumber}`);
+}
+function toggleFlipCard(cardId) {
+  const cardElem = document.getElementById(cardId);
+  cardElem.classList.toggle('flipped');
+}
+function rotateCard(cardId) {
+  const cardElem = document.getElementById(cardId);
+  let currentRotation = parseInt(cardElem.dataset.rotation || '0', 10);
+  currentRotation = (currentRotation + 90) % 360;
+  cardElem.style.transform = `rotate(${currentRotation}deg)`;
+  cardElem.dataset.rotation = currentRotation;
+}
+
+/* -------------- Context Menu Functions -------------- */
+function showContextMenu(x, y, target) {
+  const menu = document.getElementById('context-menu');
+  menu.style.top = y + 'px';
+  menu.style.left = x + 'px';
+  menu.classList.remove('hidden');
+  menu.dataset.targetId = target.id;
+}
+function hideContextMenu() {
+  const menu = document.getElementById('context-menu');
+  menu.classList.add('hidden');
+}
+document.getElementById('context-menu').addEventListener('click', e => {
+  if (e.target.tagName === 'LI') {
+    const action = e.target.getAttribute('data-action');
+    const targetId = document.getElementById('context-menu').dataset.targetId;
+    performCardAction(action, targetId);
+    hideContextMenu();
   }
 });
+function performCardAction(action, targetId) {
+  switch(action) {
+    case 'flip':
+      sendAction({ action: 'flipCard', details: { cardId: targetId } });
+      toggleFlipCard(targetId);
+      break;
+    case 'rotate':
+      sendAction({ action: 'rotateCard', details: { cardId: targetId } });
+      rotateCard(targetId);
+      break;
+    case 'zoom':
+      zoomCard(targetId);
+      break;
+    case 'draw':
+      // For simplicity, drawing a card moves the top card from deck into the hand.
+      drawCard();
+      break;
+    case 'shuffle':
+      shuffleDeck();
+      break;
+    case 'search':
+      // Implement search logic as needed.
+      alert('Search not implemented.');
+      break;
+    case 'reset-deck':
+      resetDeck();
+      break;
+    default:
+      console.log('No action defined for', action);
+  }
+}
+
+/* -------------- Card Zoom Function -------------- */
+function zoomCard(cardId) {
+  const cardElem = document.getElementById(cardId);
+  const overlay = document.createElement('div');
+  overlay.classList.add('zoom-overlay');
+  const zoomed = document.createElement('div');
+  zoomed.classList.add('zoomed-card');
+  // Use the card’s background image for zoomed view
+  zoomed.style.backgroundImage = cardElem.style.backgroundImage;
+  overlay.appendChild(zoomed);
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', () => overlay.remove());
+}
+
+/* -------------- Deck Functions -------------- */
+function drawCard() {
+  // Remove the top card from gameState.deck and add it to the local player’s hand
+  if (gameState.deck.length > 0) {
+    const drawnCard = gameState.deck.shift();
+    const localPlayer = gameState.players.find(p => p.id === gameState.peer.id);
+    if (localPlayer) {
+      localPlayer.hand.push(drawnCard);
+      // Create a card element and add it to the hand UI
+      const cardElem = createCardElement(drawnCard.id, drawnCard.image);
+      document.getElementById('hand').appendChild(cardElem);
+      setupDragAndDrop(); // Reinitialize drag listeners on new cards
+      broadcastGameState();
+    }
+  } else {
+    alert('Deck is empty.');
+  }
+}
+function shuffleDeck() {
+  // Simple Fisher–Yates shuffle
+  for (let i = gameState.deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [gameState.deck[i], gameState.deck[j]] = [gameState.deck[j], gameState.deck[i]];
+  }
+  alert('Deck shuffled.');
+  broadcastGameState();
+}
+function resetDeck() {
+  // Reset the deck: move the hero card to slot 3 and reassemble the deck in slot 9
+  // (In a full implementation, this would reinitialize the deck from the composite image)
+  alert('Deck reset.');
+  location.reload();
+}
+
+/* -------------- Send Action (Client/Host) -------------- */
+function sendAction(actionData) {
+  if (gameState.conn && gameState.conn.open) {
+    gameState.conn.send(actionData);
+  } else if (gameState.hostId) {
+    // If host, process action locally and then broadcast
+    handleIncomingAction(actionData);
+  }
+}
+
+/* -------------- Card Element Creation -------------- */
+function createCardElement(cardId, imageUrl) {
+  const card = document.createElement('div');
+  card.classList.add('card');
+  card.id = `card-${cardId}`;
+  card.style.backgroundImage = `url(${imageUrl})`;
+  card.dataset.rotation = '0';
+  card.setAttribute('draggable', true);
+  card.addEventListener('dragstart', handleDragStart);
+  card.addEventListener('dragend', handleDragEnd);
+  return card;
+}
+
+/* -------------- Deck Composite Image Slicing -------------- */
+function sliceDeckImage() {
+  // Load the composite image (assumed to be 7 rows x 10 columns)
+  const img = new Image();
+  img.src = 'assets/deck_composite.png';
+  img.onload = () => {
+    const rows = 7, cols = 10;
+    const cardCount = 41; // Use first 41 cards
+    const cardWidth = img.width / cols;
+    const cardHeight = img.height / rows;
+    const cardImages = [];
+    const canvas = document.createElement('canvas');
+    canvas.width = cardWidth;
+    canvas.height = cardHeight;
+    const ctx = canvas.getContext('2d');
+    for (let i = 0; i < cardCount; i++) {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      ctx.clearRect(0, 0, cardWidth, cardHeight);
+      ctx.drawImage(img, col * cardWidth, row * cardHeight, cardWidth, cardHeight, 0, 0, cardWidth, cardHeight);
+      cardImages.push(canvas.toDataURL());
+    }
+    // Create deck objects from the card images and cardDatabase information.
+    // Assume that cardDatabase is in the same order as the deck images.
+    gameState.deck = [];
+    for (let i = 0; i < cardImages.length; i++) {
+      // Merge card data from cardDatabase with the sliced image.
+      const cardData = cardDatabase[i] || { id: i+1, card_name: `Card ${i+1}` };
+      cardData.image = cardImages[i];
+      gameState.deck.push(cardData);
+    }
+    // Place the first card (hero) into the hero slot
+    const heroCardData = gameState.deck.shift();
+    const heroElem = createCardElement(heroCardData.id, heroCardData.image);
+    document.querySelector('.hero-slot').appendChild(heroElem);
+    // For the deck slot, show a card-back element
+    const deckSlot = document.querySelector('.deck-slot');
+    const deckBack = document.createElement('div');
+    deckBack.classList.add('card', 'card-back');
+    deckSlot.appendChild(deckBack);
+  };
+}
